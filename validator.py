@@ -242,9 +242,14 @@ def check_pivot(transforms=None):
 
 def check_uvs(transforms=None):
     """
-    Check UV health for export + Unreal lightmaps:
-      1. Mesh must have at least one UV set (or it can't be textured).
-      2. Static meshes should have a 2nd UV channel for lightmaps in UE.
+    Check UV health for texturing. (Lumen project — no lightmap UV needed,
+    since Lumen is fully dynamic and bakes nothing.)
+
+    Tiers:
+      1. Mesh has at least one UV set (or it can't be textured at all).
+      2. That UV set actually contains UVs (an empty set is a silent trap).
+      3. UVs fall within the standard 0-1 space (UVs sprawling far outside
+         0-1 usually mean an unwrap was never laid out properly).
 
     Returns a list of failure dicts: {"object", "name", "reason"}.
     """
@@ -261,21 +266,27 @@ def check_uvs(transforms=None):
             continue
         shape = shapes[0]
 
-        # list all UV sets on this mesh
+        # all UV sets on this mesh
         uv_sets = cmds.polyUVSet(shape, query=True, allUVSets=True) or []
 
-        # Rule 1: no UV sets at all -> can't be textured
+        # Tier 1: no UV sets at all -> can't be textured
         if not uv_sets:
             failures.append({
                 "object": t,
                 "name": name,
                 "reason": "no UV sets — mesh can't be textured",
             })
-            continue  # nothing more to check if there are zero UVs
+            continue
 
-        # Rule 2: does the FIRST UV set actually contain UVs? (empty set = nothing)
-        uv_count = cmds.polyEvaluate(shape, uvComponent=True)
-        if not uv_count:
+        # Query the actual UV coordinates ONCE. polyEditUV (query) returns a
+        # flat list [u0, v0, u1, v1, ...]. This is the reliable way to know
+        # whether UVs exist AND where they are — polyEvaluate(uvComponent=True)
+        # is inconsistent across Maya versions and falsely reports empty.
+        uv_indices = "{}.map[*]".format(shape)
+        coords = cmds.polyEditUV(uv_indices, query=True) or []
+
+        # Tier 2: set exists but holds no actual UVs -> never unwrapped
+        if not coords:
             failures.append({
                 "object": t,
                 "name": name,
@@ -283,14 +294,168 @@ def check_uvs(transforms=None):
             })
             continue
 
-        # Rule 3: only one UV set -> missing the lightmap channel UE wants
-        if len(uv_sets) < 2:
+        # Tier 3: are the UVs roughly inside the 0-1 space?
+        us = coords[0::2]   # even indices = U
+        vs = coords[1::2]   # odd indices  = V
+        margin = 0.001       # tiny tolerance so values right at 0 or 1 pass
+        out_of_bounds = (
+            min(us) < -margin or max(us) > 1.0 + margin or
+            min(vs) < -margin or max(vs) > 1.0 + margin
+        )
+        if out_of_bounds:
             failures.append({
                 "object": t,
                 "name": name,
-                "reason": "only 1 UV channel — add UV1 for Unreal lightmaps",
+                "reason": "UVs extend outside 0-1 space — check the unwrap layout",
             })
 
     return failures
 
-def run_all(): ...
+# ===========================================================================
+#  run_all  +  PySide6 UI   (Maya 2026 / Qt6)
+#  Append this to the bottom of validator.py
+# ===========================================================================
+
+def run_all(transforms=None):
+    """
+    Run every check and return one merged list of failures.
+    Each failure gets a 'check' field so the UI knows which check raised it.
+
+    We resolve the mesh list ONCE and hand it to every check, so a big scene
+    isn't scanned five separate times.
+
+    Returns: list of {"check", "object", "name", "reason"}.
+    """
+    if transforms is None:
+        transforms = _all_mesh_transforms()
+
+    checks = {
+        "naming":     check_naming,
+        "transforms": check_transforms,
+        "history":    check_history,
+        "pivot":      check_pivot,
+        "uvs":        check_uvs,
+    }
+
+    all_failures = []
+    for check_name, fn in checks.items():
+        for f in fn(transforms):
+            f["check"] = check_name      # tag it
+            all_failures.append(f)
+
+    return all_failures
+
+
+# ---------------------------------------------------------------------------
+#  UI
+# ---------------------------------------------------------------------------
+from PySide6 import QtWidgets, QtCore, QtGui   # Maya 2026 = PySide6 (Qt6)
+from shiboken6 import wrapInstance             # PySide6's companion (was shiboken2)
+import maya.OpenMayaUI as omui
+
+
+def _maya_main_window():
+    """Get Maya's main window as a Qt object so our tool docks to it correctly."""
+    ptr = omui.MQtUtil.mainWindow()
+    return wrapInstance(int(ptr), QtWidgets.QWidget)
+
+
+# colour per check type, so the report is scannable at a glance
+_CHECK_COLOR = {
+    "naming":     "#e0a132",
+    "transforms": "#6aa9e0",
+    "history":    "#c77dff",
+    "pivot":      "#82c77d",
+    "uvs":        "#e0635c",
+}
+
+
+class ValidatorUI(QtWidgets.QDialog):
+
+    def __init__(self, parent=None):
+        super().__init__(parent or _maya_main_window())
+        self.setWindowTitle("Export Validator")
+        self.setMinimumWidth(520)
+        self.setMinimumHeight(420)
+        self._build()
+
+    def _build(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # --- top bar: run button + summary label ---
+        top = QtWidgets.QHBoxLayout()
+        self.run_btn = QtWidgets.QPushButton("Validate Scene")
+        self.run_btn.setMinimumHeight(34)
+        self.run_btn.clicked.connect(self._on_run)
+        top.addWidget(self.run_btn)
+
+        self.summary = QtWidgets.QLabel("Ready.")
+        self.summary.setStyleSheet("font-weight: bold;")
+        top.addWidget(self.summary, stretch=1)
+        layout.addLayout(top)
+
+        # --- results table ---
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Check", "Object", "Problem"])
+        self.table.horizontalHeader().setSectionResizeMode(
+            2, QtWidgets.QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        # clicking a row selects that object in Maya
+        self.table.itemSelectionChanged.connect(self._on_row_selected)
+        layout.addWidget(self.table)
+
+        self._rows = []   # parallel list of object long-names, row-aligned
+
+    def _on_run(self):
+        failures = run_all()
+        self.table.setRowCount(0)
+        self._rows = []
+
+        if not failures:
+            self.summary.setText("✓  All checks passed — scene is export-ready.")
+            self.summary.setStyleSheet("font-weight: bold; color: #82c77d;")
+            return
+
+        self.summary.setText(f"✗  {len(failures)} issue(s) found.")
+        self.summary.setStyleSheet("font-weight: bold; color: #e0635c;")
+
+        for f in failures:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            check_item = QtWidgets.QTableWidgetItem(f["check"])
+            color = _CHECK_COLOR.get(f["check"], "#cccccc")
+            check_item.setForeground(QtGui.QColor(color))
+
+            self.table.setItem(row, 0, check_item)
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(f["name"]))
+            self.table.setItem(row, 2, QtWidgets.QTableWidgetItem(f["reason"]))
+            self._rows.append(f["object"])
+
+    def _on_row_selected(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return
+        idx = rows[0].row()
+        obj = self._rows[idx]
+        if cmds.objExists(obj):
+            cmds.select(obj, replace=True)   # jump-to-object in Maya
+
+
+# keep a module-level reference so Python's garbage collector doesn't
+# close the window the instant the function returns
+_validator_window = None
+
+def show():
+    """Call this from the script editor:  import validator; validator.show()"""
+    global _validator_window
+    try:
+        _validator_window.close()
+    except Exception:
+        pass
+    _validator_window = ValidatorUI()
+    _validator_window.show()
